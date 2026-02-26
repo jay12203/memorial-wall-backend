@@ -1,5 +1,4 @@
 // Memorial Wall Backend 
-// (Cloudinary Storage + SQLite Metadata + SSE)
 
 require("dotenv").config();
 
@@ -7,19 +6,25 @@ const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const { v4: uuidv4 } = require("uuid");
-const sqlite3 = require("sqlite3").verbose();
 const cloudinary = require("cloudinary").v2;
+const { Pool } = require("pg");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // ---------------------------
-// Settings (.env)
+// Settings (.env / Render Env Vars)
 // ---------------------------
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const ADMIN_KEY = process.env.ADMIN_KEY || "12345";
 const MAX_PHOTOS = parseInt(process.env.MAX_PHOTOS || "10000", 10);
+
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+  console.error("Missing DATABASE_URL. Add it in Render Environment variables.");
+  process.exit(1);
+}
 
 // ---------------------------
 // Cloudinary config
@@ -31,27 +36,33 @@ cloudinary.config({
 });
 
 // ---------------------------
-// SQLite setup
+// Postgres setup
 // ---------------------------
-const DB_PATH = "./photos.db";
-const db = new sqlite3.Database(DB_PATH);
-
-db.serialize(() => {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS photos (
-      id TEXT PRIMARY KEY,
-      publicId TEXT NOT NULL,
-      url TEXT NOT NULL,
-      thumbnailUrl TEXT NOT NULL,
-      createdAt TEXT NOT NULL
-    )
-  `);
-
-  db.run(`CREATE INDEX IF NOT EXISTS idx_photos_createdAt ON photos(createdAt)`);
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  // Render Postgres commonly requires SSL; this setting is safe on Render
+  ssl: { rejectUnauthorized: false },
 });
 
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS photos (
+      id TEXT PRIMARY KEY,
+      public_id TEXT NOT NULL,
+      url TEXT NOT NULL,
+      thumbnail_url TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_photos_created_at
+    ON photos (created_at DESC);
+  `);
+}
+
 // ---------------------------
-// Multer (memory storage) - because we upload to Cloudinary directly
+// Multer (memory storage)  
 // ---------------------------
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -72,45 +83,13 @@ const sseClients = new Set();
 
 function sseSend(data) {
   const payload = `data: ${JSON.stringify(data)}\n\n`;
-  for (const res of sseClients) {
-    res.write(payload);
-  }
+  for (const res of sseClients) res.write(payload);
 }
 
 // ---------------------------
 // Helpers
 // ---------------------------
-function enforceMaxPhotos() {
-  // Delete anything beyond MAX_PHOTOS (oldest ones)
-  db.all(
-    `
-    SELECT id, publicId
-    FROM photos
-    ORDER BY datetime(createdAt) DESC
-    LIMIT ? OFFSET ?
-    `,
-    [1000000, MAX_PHOTOS],
-    (err, rows) => {
-      if (err || !rows || rows.length === 0) return;
-
-      // delete from cloudinary + db
-      const ids = rows.map((r) => r.id);
-      const publicIds = rows.map((r) => r.publicId);
-
-      // delete images in Cloudinary (best effort)
-      publicIds.forEach((pid) => {
-        cloudinary.uploader.destroy(pid).catch(() => {});
-      });
-
-      const placeholders = ids.map(() => "?").join(",");
-      db.run(`DELETE FROM photos WHERE id IN (${placeholders})`, ids);
-    }
-  );
-}
-
 function makeThumbnailUrl(publicId) {
-  // Cloudinary transformation URL (fast thumbnail)
-  // width 250, auto crop, auto quality/format
   return cloudinary.url(publicId, {
     secure: true,
     transformation: [
@@ -120,29 +99,51 @@ function makeThumbnailUrl(publicId) {
   });
 }
 
+async function enforceMaxPhotos() {
+  // Delete anything beyond MAX_PHOTOS (oldest ones)
+  const extra = await pool.query(
+    `
+    SELECT id, public_id
+    FROM photos
+    ORDER BY created_at DESC
+    OFFSET $1
+    `,
+    [MAX_PHOTOS]
+  );
+
+  if (!extra.rows || extra.rows.length === 0) return;
+
+  const ids = extra.rows.map((r) => r.id);
+  const publicIds = extra.rows.map((r) => r.public_id);
+
+  // Best-effort delete from Cloudinary
+  for (const pid of publicIds) {
+    try {
+      await cloudinary.uploader.destroy(pid);
+    } catch {}
+  }
+
+  // Delete from DB
+  await pool.query(`DELETE FROM photos WHERE id = ANY($1::text[])`, [ids]);
+}
+
 // ---------------------------
 // Routes
 // ---------------------------
-
 app.get("/", (req, res) => {
   res.send("Backend is running");
 });
 
 /*
-  GET /events  (SSE)
-  Wall connects here once, and receives updates instantly when new photos are uploaded/deleted.
+  GET /events (SSE)
 */
 app.get("/events", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
-
-  // If you're behind proxies sometimes:
   res.flushHeaders?.();
 
   sseClients.add(res);
-
-  // Send a hello event
   res.write(`data: ${JSON.stringify({ type: "hello" })}\n\n`);
 
   req.on("close", () => {
@@ -152,44 +153,46 @@ app.get("/events", (req, res) => {
 
 /*
   GET /photos?limit=800
-  Returns latest photos for the wall.
 */
-app.get("/photos", (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit || "800", 10), 2000);
+app.get("/photos", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || "800", 10), 2000);
 
-  db.all(
-    `
-    SELECT id, url, thumbnailUrl, createdAt
-    FROM photos
-    ORDER BY datetime(createdAt) DESC
-    LIMIT ?
-    `,
-    [limit],
-    (err, rows) => {
-      if (err) return res.status(500).json({ message: "DB error", error: err.message });
-      res.json(rows);
-    }
-  );
+    const result = await pool.query(
+      `
+      SELECT id,
+             url,
+             thumbnail_url AS "thumbnailUrl",
+             created_at AS "createdAt"
+      FROM photos
+      ORDER BY created_at DESC
+      LIMIT $1
+      `,
+      [limit]
+    );
+
+    return res.json(result.rows);
+  } catch (err) {
+    return res.status(500).json({ message: "DB error", error: err.message });
+  }
 });
 
-  // POST /upload
-
+/*
+  POST /upload (field name must be "file")
+*/
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: "No file uploaded" });
 
     const id = uuidv4();
     const createdAt = new Date().toISOString();
-
-    // Cloudinary folder 
     const folder = "memorial_wall";
 
-    // Upload buffer 
     const uploadResult = await new Promise((resolve, reject) => {
       const stream = cloudinary.uploader.upload_stream(
         {
           folder,
-          public_id: id, // use our id as public id for easy management
+          public_id: id, // stable id
           resource_type: "image",
           overwrite: true,
         },
@@ -198,67 +201,77 @@ app.post("/upload", upload.single("file"), async (req, res) => {
           resolve(result);
         }
       );
-
       stream.end(req.file.buffer);
     });
 
-    const publicId = uploadResult.public_id; // e.g. memorial_wall/<id>
-    const url = uploadResult.secure_url;      // https image url
+    const publicId = uploadResult.public_id;
+    const url = uploadResult.secure_url;
     const thumbnailUrl = makeThumbnailUrl(publicId);
 
-    // Insert into DB
-    db.run(
-      `INSERT INTO photos (id, publicId, url, thumbnailUrl, createdAt) VALUES (?, ?, ?, ?, ?)`,
-      [id, publicId, url, thumbnailUrl, createdAt],
-      (err) => {
-        if (err) return res.status(500).json({ message: "DB insert error", error: err.message });
-
-        // Cleanup old photos
-        enforceMaxPhotos();
-
-        const photo = { id, url, thumbnailUrl, createdAt };
-
-        // Live update for wall
-        sseSend({ type: "photo_uploaded", photo });
-
-        return res.json({ message: "Uploaded successfully", photo });
-      }
+    await pool.query(
+      `
+      INSERT INTO photos (id, public_id, url, thumbnail_url, created_at)
+      VALUES ($1, $2, $3, $4, $5)
+      `,
+      [id, publicId, url, thumbnailUrl, createdAt]
     );
-  } catch (error) {
-    return res.status(500).json({ message: "Upload failed", error: error.message });
+
+    // keep DB size under control
+    enforceMaxPhotos().catch(() => {});
+
+    const photo = { id, url, thumbnailUrl, createdAt };
+
+    // live update for wall
+    sseSend({ type: "photo_uploaded", photo });
+
+    return res.json({ message: "Uploaded successfully", photo });
+  } catch (err) {
+    return res.status(500).json({ message: "Upload failed", error: err.message });
   }
 });
 
 /*
   DELETE /photos/:id (Admin only)
-  - Requires header: x-admin-key: <ADMIN_KEY>
-  - Deletes from Cloudinary and SQLite
+  Header: x-admin-key: <ADMIN_KEY>
 */
-app.delete("/photos/:id", (req, res) => {
-  const key = req.headers["x-admin-key"];
-  if (key !== ADMIN_KEY) return res.status(403).json({ message: "Forbidden (Admin only)" });
+app.delete("/photos/:id", async (req, res) => {
+  try {
+    const key = req.headers["x-admin-key"];
+    if (key !== ADMIN_KEY) return res.status(403).json({ message: "Forbidden (Admin only)" });
 
-  const { id } = req.params;
+    const { id } = req.params;
 
-  db.get(`SELECT publicId FROM photos WHERE id = ?`, [id], async (err, row) => {
-    if (err) return res.status(500).json({ message: "DB error", error: err.message });
-    if (!row) return res.status(404).json({ message: "Photo not found" });
+    const row = await pool.query(`SELECT public_id FROM photos WHERE id = $1`, [id]);
+    if (!row.rows || row.rows.length === 0) return res.status(404).json({ message: "Photo not found" });
 
-    // Delete from Cloudinary
-    try { await cloudinary.uploader.destroy(row.publicId); } catch {}
+    const publicId = row.rows[0].public_id;
 
-    // Delete from DB
-    db.run(`DELETE FROM photos WHERE id = ?`, [id], (err2) => {
-      if (err2) return res.status(500).json({ message: "DB delete error", error: err2.message });
+    // delete from Cloudinary 
+    try {
+      await cloudinary.uploader.destroy(publicId);
+    } catch {}
 
-      // Live update for wall
-      sseSend({ type: "photo_deleted", id });
+    // delete from DB
+    await pool.query(`DELETE FROM photos WHERE id = $1`, [id]);
 
-      return res.json({ message: "Photo deleted successfully", id });
+    sseSend({ type: "photo_deleted", id });
+
+    return res.json({ message: "Photo deleted successfully", id });
+  } catch (err) {
+    return res.status(500).json({ message: "Delete failed", error: err.message });
+  }
+});
+
+// ---------------------------
+// Start
+// ---------------------------
+initDb()
+  .then(() => {
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on 0.0.0.0:${PORT}`);
     });
+  })
+  .catch((err) => {
+    console.error("Failed to init DB:", err.message);
+    process.exit(1);
   });
-});
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on http://0.0.0.0:${PORT}`);
-});
